@@ -9,12 +9,6 @@
 #include "hash.h"
 #include "kvstore.h"
 
-// DO NOT MODIFY THIS.
-// ./check.py assumes the hashtable has 256 buckets.
-// You should initialize your hashtable with this capacity.
-#define HT_CAPACITY 256
-#define WORKER_THREADS 1000
-
 void init_table()
 {
     ht = malloc(sizeof(hashtable_t));
@@ -46,80 +40,107 @@ hash_item_t* get_item(char* key, unsigned h)
             item = curr_item;
             break;
         }
+        curr_item = curr_item->next;
     }
     return item;
 }
 
+int remove_item(char* key, unsigned h)
+{
+
+    hash_item_t* item = get_item(key, h);
+    if(item != NULL)
+    {
+        if(item->prev != NULL) item->prev->next = item->next;
+        if(item->next != NULL) item->next->prev = item->prev;
+        if(item == ht->items[h]) ht->items[h] = item->next;
+        return 0;
+    }
+    return -1;
+}
+
+int set_count = 0;
 int set_request(int socket, struct request *request)
 {
+    set_count++;
     size_t len = 0;
     size_t expected_len = request->msg_len;
 
-    // 1. Lock the hashtable entry. Create it if the key is not in the store.
-    unsigned h = calculate_pos(request);
-    hash_item_t* itm = get_item(request->key, h);
-    if(itm == NULL)
-    {
-        itm = malloc(sizeof(hash_item_t));
-        itm->next = ht->items[h];
-        itm->prev = NULL;
+    char* value = malloc(expected_len + 1);
+    value[expected_len] = '\0';
 
-        if(ht->items[h] != NULL)
-        {
-            ht->items[h]->prev = itm;
-        }
+    int buf_size = 0;
+    const int max_buf_size = 4096;
 
-        ht->items[h] = itm;
-
-        itm->key = malloc(strlen(request->key) + 1);
-        strcpy(itm->key, request->key);
-    }
-
-   
-        // 2. Read the payload from the socket
-        // Note: Clients may send a partial chunk of the payload so you should not wait
-        // for the full data to be available before write in the hashtable entry.
-
-    printf("expected len %lu\n", expected_len);
-    
-    size_t buf_size = 4096;
-    size_t curr_buf_size;
-
-    itm->value_size = expected_len;
-    itm->value = malloc(expected_len + 1);
-    itm->value[expected_len] = '\0';
-
+    pr_debug("Fetching contents of key %s\n", request->key);
     while(len < expected_len)
     {
-        curr_buf_size = expected_len - len;
-        curr_buf_size = curr_buf_size >= buf_size ? buf_size : curr_buf_size;
+        buf_size = expected_len - len;
+        buf_size = buf_size >= max_buf_size ? max_buf_size : buf_size;
+        char buf[max_buf_size];
 
-        char buf[curr_buf_size];
 
-        int rcved = read_payload(socket, request, curr_buf_size, buf);
-        if((size_t)rcved != curr_buf_size)
+        int rcved = read_payload(socket, request, buf_size, buf);
+        if(rcved != buf_size)
         {
             send_response(socket, STORE_ERROR, 0, NULL);
             request->connection_close = 1;
             return -1;
         }
 
-        memcpy(itm->value + len, buf, curr_buf_size);
-        len += curr_buf_size;
+        memcpy(value + len, buf, buf_size);
+        len += buf_size;
     }
 
-    // 4. Unlock the entry in the store to finalize the insertion.
-    // This allow other threads to read the entry.
-
-    // It checks if the payload has been fully received .
-    // It also reads the last char of the request which should be '\n'
     if(check_payload(socket, request, expected_len) != 0)
     {
-        send_response(socket, PARSING_ERROR, 0, NULL);
+        send_response(socket, STORE_ERROR, 0, NULL);
+        request->connection_close = 1;
+        return -1;
+    }
+    
+    unsigned h = calculate_pos(request);
+    hash_item_t* itm = get_item(request->key, h);
+    if(itm == NULL)
+    {
+
+        itm = malloc(sizeof(hash_item_t));
+        itm->next = ht->items[h];
+        itm->prev = NULL;
+
+        itm->user = malloc(sizeof(struct user_item));
+        pthread_mutex_init(&itm->user->mutex, NULL);
+
+        if(ht->items[h] != NULL)
+        {
+            ht->items[h]->prev = itm;
+        }
+        ht->items[h] = itm;
+        itm->key = malloc(strlen(request->key) + 1);
+        strcpy(itm->key, request->key);
+    }
+
+    pr_debug("Now in set request nr %d with key %s\n", set_count, request->key);
+    if(pthread_mutex_trylock(&itm->user->mutex) != 0)
+    {
+        send_response(socket, KEY_ERROR, 0, NULL);
+        request->connection_close = 1;
+        return -1;
+    }
+    
+    itm->value_size = expected_len;
+    itm->value = malloc(expected_len + 1);
+    memcpy(itm->value, value, expected_len + 1);
+
+    if(pthread_mutex_unlock(&itm->user->mutex) != 0)
+    {
+        send_response(socket, KEY_ERROR, 0, NULL);
+        request->connection_close = 1;
         return -1;
     }
 
     send_response(socket, OK, 0, NULL);
+
     // Optionally you can close the connection
     // You should do it ONLY on errors:
     // request->connection_close = 1;
@@ -133,28 +154,22 @@ int get_request(int socket, struct request *request)
 
     if(itm == NULL)
     {
-        send_response(socket, KEY_ERROR, 0, NULL);
+        if(send_response(socket, KEY_ERROR, 0, NULL) == 0) pr_info("GET response sent KEY_ERROR\n");
         return -1;
     }
 
-    send_response(socket, OK, itm->value_size, itm->value);
+    if(send_response(socket, OK, itm->value_size, itm->value) == 0) pr_info("GET response sent OK\n");
     return 0;
 }
 
 int del_request(int socket, struct request *request)
 {
     int h = calculate_pos(request);
-    hash_item_t* item = get_item(request->key, h);
-
-    if(item == NULL)
+    if(remove_item(request->key, h) != 0)
     {
         send_response(socket, KEY_ERROR, 0, NULL);
         return -1;
     }
-
-    if(item->prev != NULL) item->prev->next = item->next;
-    if(item->next != NULL) item->next->prev = item->prev;
-    if(item == ht->items[h]) ht->items[h] = item->next;
 
     send_response(socket, OK, 0, NULL);
     return 0;
@@ -190,6 +205,7 @@ void *main_job(void *arg)
             // Implement your reset command here.
             destroy_table();
             init_table();
+            set_count = 0;
             send_response(conn_info->socket_fd, OK, 0, NULL);
             break;
         case STAT:
@@ -208,18 +224,20 @@ void *main_job(void *arg)
     return (void *)NULL;
 }
 
+
 int main(int argc, char *argv[])
 {
     int listen_sock;
-    init_table();
-
     listen_sock = server_init(argc, argv);
 
     // Initialuze your hashtable.
     // @see kvstore.h for hashtable struct declaration
+    init_table();
 
-    pthread_t th[WORKER_THREADS];
-    int i = 0;
+
+    //init worker threads and job queue
+
+   
     for (;;) {
         struct conn_info *conn_info =
             calloc(1, sizeof(struct conn_info));
@@ -228,8 +246,8 @@ int main(int argc, char *argv[])
             free(conn_info);
             continue;
         }
-        pthread_create(&th[i], NULL, main_job, conn_info);
-        i++;
+        pthread_t th;
+        pthread_create(&th, NULL, main_job, conn_info);
     } 
 
     return 0;
