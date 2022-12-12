@@ -122,13 +122,12 @@ int set_request(int socket, struct request *request)
 
         itm->key = malloc(strlen(request->key) + 1);
         strcpy(itm->key, request->key);
-
-        pthread_rwlock_unlock(item_mutex);
     }
     else
     {
         item_mutex = &itm->user->item_mutex;
         bucket_mutex = &ht->user->bucket_mutexes[h];
+        if(try_lock(socket, request, item_mutex) != 0) return -1;
     }
 
     char* value = malloc(expected_len + 1);
@@ -152,8 +151,9 @@ int set_request(int socket, struct request *request)
         {
             if(try_lock(socket, request, bucket_mutex) != 0) return -1;
             remove_item(request->key, h);
-            send_response(socket, STORE_ERROR, 0, NULL);
             pthread_rwlock_unlock(bucket_mutex);
+            pthread_rwlock_unlock(item_mutex);
+            send_response(socket, STORE_ERROR, 0, NULL);
             return -1;
         }
 
@@ -166,14 +166,12 @@ int set_request(int socket, struct request *request)
     {
         if(try_lock(socket, request, bucket_mutex) != 0) return -1;
         remove_item(request->key, h);
-        send_response(socket, STORE_ERROR, 0, NULL);
         pthread_rwlock_unlock(bucket_mutex);
+        pthread_rwlock_unlock(item_mutex);
+        send_response(socket, STORE_ERROR, 0, NULL);
         return -1;
     }
     
-
-
-    if(try_lock(socket, request, item_mutex) != 0) return -1;
 
     pr_debug("Assigining value of key %s in socket %d\n", request->key, socket);
 
