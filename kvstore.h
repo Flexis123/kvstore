@@ -8,11 +8,11 @@
 #define HT_CAPACITY 256
 
 struct user_item {
-    pthread_mutex_t mutex;
+    pthread_rwlock_t item_mutex;
 };
 
 struct user_ht {
-    pthread_mutex_t bucket_mutexes[HT_CAPACITY];
+    pthread_rwlock_t bucket_mutexes[HT_CAPACITY];
 };
 
 #define THREAD_POOL_SIZE 200u

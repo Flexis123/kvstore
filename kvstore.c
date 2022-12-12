@@ -15,10 +15,23 @@ void init_table()
     ht->capacity = HT_CAPACITY;
     ht->items = calloc(HT_CAPACITY, sizeof(hash_item_t*));
     ht->user = malloc(sizeof(struct user_ht));
+
+    for(unsigned i = 0; i < HT_CAPACITY; i++) pthread_rwlock_init(&ht->user->bucket_mutexes[i], NULL);
 }
 
 void destroy_table()
 {
+    for(unsigned i = 0; i < HT_CAPACITY; i++) {
+        pthread_rwlock_destroy(&ht->user->bucket_mutexes[i]);
+
+        hash_item_t* curr_item = ht->items[i];
+
+        while(curr_item != NULL)
+        {
+            pthread_rwlock_destroy(&curr_item->user->item_mutex);
+            curr_item = curr_item->next;
+        }
+    }
     free(ht);
     ht = NULL;
 }
@@ -59,6 +72,18 @@ int remove_item(char* key, unsigned h)
     return -1;
 }
 
+int try_lock(int socket, struct request *request, pthread_rwlock_t* mutex)
+{
+    if(pthread_rwlock_trywrlock(mutex) != 0)
+    {
+        pthread_rwlock_unlock(mutex);
+        request->connection_close = 1;
+        send_response(socket, KEY_ERROR, 0, NULL);
+        return -1;
+    }
+    return 0;
+}
+
 int set_count = 0;
 int set_request(int socket, struct request *request)
 {
@@ -66,25 +91,69 @@ int set_request(int socket, struct request *request)
     size_t len = 0;
     size_t expected_len = request->msg_len;
 
+    unsigned h = calculate_pos(request);
+    hash_item_t* itm = get_item(request->key, h);
+    pthread_rwlock_t* item_mutex;
+    pthread_rwlock_t* bucket_mutex;
+
+    if(itm == NULL)
+    {
+        itm = malloc(sizeof(hash_item_t));
+
+        itm->user = malloc(sizeof(struct user_item));
+        pthread_rwlock_init(&itm->user->item_mutex, NULL);
+        item_mutex = &itm->user->item_mutex;
+        bucket_mutex = &ht->user->bucket_mutexes[h];
+
+        if(try_lock(socket, request, bucket_mutex) != 0) return -1;
+        pthread_rwlock_wrlock(item_mutex);
+        
+        itm->next = ht->items[h];
+        itm->prev = NULL;
+
+
+        if(ht->items[h] != NULL)
+        {
+            ht->items[h]->prev = itm;
+        }
+        ht->items[h] = itm;
+
+        pthread_rwlock_unlock(bucket_mutex);
+
+        itm->key = malloc(strlen(request->key) + 1);
+        strcpy(itm->key, request->key);
+
+        pthread_rwlock_unlock(item_mutex);
+    }
+    else
+    {
+        item_mutex = &itm->user->item_mutex;
+        bucket_mutex = &ht->user->bucket_mutexes[h];
+    }
+
     char* value = malloc(expected_len + 1);
     value[expected_len] = '\0';
 
     int buf_size = 0;
     const int max_buf_size = 4096;
 
-    pr_debug("Fetching contents of key %s\n", request->key);
+    
+
+    pr_debug("Reading msg of size %lu for key %s in socket %d\n", expected_len, request->key, socket);
     while(len < expected_len)
     {
         buf_size = expected_len - len;
         buf_size = buf_size >= max_buf_size ? max_buf_size : buf_size;
-        char buf[max_buf_size];
-
+        char buf[buf_size];
 
         int rcved = read_payload(socket, request, buf_size, buf);
+        pr_debug("Reading payload of size %d for key %s in socket %d\n", buf_size, request->key, socket);
         if(rcved != buf_size)
         {
+            if(try_lock(socket, request, bucket_mutex) != 0) return -1;
+            remove_item(request->key, h);
             send_response(socket, STORE_ERROR, 0, NULL);
-            request->connection_close = 1;
+            pthread_rwlock_unlock(bucket_mutex);
             return -1;
         }
 
@@ -92,58 +161,28 @@ int set_request(int socket, struct request *request)
         len += buf_size;
     }
 
+    pr_debug("Checking payload  of key %s in socket %d\n", request->key, socket);
     if(check_payload(socket, request, expected_len) != 0)
     {
+        if(try_lock(socket, request, bucket_mutex) != 0) return -1;
+        remove_item(request->key, h);
         send_response(socket, STORE_ERROR, 0, NULL);
-        request->connection_close = 1;
+        pthread_rwlock_unlock(bucket_mutex);
         return -1;
     }
     
-    unsigned h = calculate_pos(request);
-    hash_item_t* itm = get_item(request->key, h);
-    if(itm == NULL)
-    {
 
-        itm = malloc(sizeof(hash_item_t));
-        itm->next = ht->items[h];
-        itm->prev = NULL;
 
-        itm->user = malloc(sizeof(struct user_item));
-        pthread_mutex_init(&itm->user->mutex, NULL);
+    if(try_lock(socket, request, item_mutex) != 0) return -1;
 
-        if(ht->items[h] != NULL)
-        {
-            ht->items[h]->prev = itm;
-        }
-        ht->items[h] = itm;
-        itm->key = malloc(strlen(request->key) + 1);
-        strcpy(itm->key, request->key);
-    }
+    pr_debug("Assigining value of key %s in socket %d\n", request->key, socket);
 
-    pr_debug("Now in set request nr %d with key %s\n", set_count, request->key);
-    if(pthread_mutex_trylock(&itm->user->mutex) != 0)
-    {
-        send_response(socket, KEY_ERROR, 0, NULL);
-        request->connection_close = 1;
-        return -1;
-    }
-    
+    itm->value = value;
     itm->value_size = expected_len;
-    itm->value = malloc(expected_len + 1);
-    memcpy(itm->value, value, expected_len + 1);
 
-    if(pthread_mutex_unlock(&itm->user->mutex) != 0)
-    {
-        send_response(socket, KEY_ERROR, 0, NULL);
-        request->connection_close = 1;
-        return -1;
-    }
+    pthread_rwlock_unlock(item_mutex);
 
     send_response(socket, OK, 0, NULL);
-
-    // Optionally you can close the connection
-    // You should do it ONLY on errors:
-    // request->connection_close = 1;
     return len;
 }
 
@@ -182,9 +221,9 @@ void *main_job(void *arg)
     struct request *request = allocate_request();
     request->connection_close = 0;
 
-    pr_info("Starting new session from %s:%d\n",
+    pr_info("Starting new session from %s:%d sock_nr %d\n",
         inet_ntoa(conn_info->addr.sin_addr),
-        ntohs(conn_info->addr.sin_port));
+        ntohs(conn_info->addr.sin_port), conn_info->socket_fd);
 
     do {
         method = recv_request(conn_info->socket_fd, request);
