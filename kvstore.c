@@ -121,6 +121,8 @@ int set_request(int socket, struct request *request)
         pthread_rwlock_unlock(bucket_mutex);
 
         itm->key = malloc(strlen(request->key) + 1);
+        itm->value_size = 0;
+        itm->value = NULL;
         strcpy(itm->key, request->key);
     }
     else
@@ -153,6 +155,7 @@ int set_request(int socket, struct request *request)
             remove_item(request->key, h);
             pthread_rwlock_unlock(bucket_mutex);
             pthread_rwlock_unlock(item_mutex);
+            request->connection_close = 1;
             send_response(socket, STORE_ERROR, 0, NULL);
             return -1;
         }
