@@ -76,8 +76,7 @@ int try_lock(int socket, struct request *request, pthread_rwlock_t* mutex)
 {
     if(pthread_rwlock_trywrlock(mutex) != 0)
     {
-        pthread_rwlock_unlock(mutex);
-        request->connection_close = 1;
+        request->connection_close = 0;
         send_response(socket, KEY_ERROR, 0, NULL);
         return -1;
     }
@@ -129,7 +128,10 @@ int set_request(int socket, struct request *request)
     {
         item_mutex = &itm->user->item_mutex;
         bucket_mutex = &ht->user->bucket_mutexes[h];
-        if(try_lock(socket, request, item_mutex) != 0) return -1;
+        if(try_lock(socket, request, item_mutex) != 0) {
+            pr_debug("Socket nr %d denied mutex acces\n", socket);
+            return -1;
+        }
     }
 
     char* value = malloc(expected_len + 1);
@@ -151,11 +153,12 @@ int set_request(int socket, struct request *request)
         pr_debug("Reading payload of size %d for key %s in socket %d\n", buf_size, request->key, socket);
         if(rcved != buf_size)
         {
+            if(pthread_rwlock_unlock(item_mutex) == 0) pr_debug("Unlocked item_mutex on socket nr %d\n", socket);
+
             if(try_lock(socket, request, bucket_mutex) != 0) return -1;
             remove_item(request->key, h);
             pthread_rwlock_unlock(bucket_mutex);
-            pthread_rwlock_unlock(item_mutex);
-            request->connection_close = 1;
+            request->connection_close = 0;
             send_response(socket, STORE_ERROR, 0, NULL);
             return -1;
         }
@@ -167,10 +170,12 @@ int set_request(int socket, struct request *request)
     pr_debug("Checking payload  of key %s in socket %d\n", request->key, socket);
     if(check_payload(socket, request, expected_len) != 0)
     {
+        pthread_rwlock_unlock(item_mutex);
+
         if(try_lock(socket, request, bucket_mutex) != 0) return -1;
         remove_item(request->key, h);
         pthread_rwlock_unlock(bucket_mutex);
-        pthread_rwlock_unlock(item_mutex);
+        request->connection_close = 0;
         send_response(socket, STORE_ERROR, 0, NULL);
         return -1;
     }
